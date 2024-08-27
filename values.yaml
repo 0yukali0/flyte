@@ -1,0 +1,11 @@
+embedAdmissionController: false
+enableSchedulerPlugin: false
+enableWebService: false
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 1Gi
+  limits:
+    cpu: 200m
+    memory: 1Gi

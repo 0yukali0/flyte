@@ -41,10 +41,11 @@ tasks:
       - container
       - sidecar
       - K8S-ARRAY
+      - ray
     default-for-task-types:
       - container: container
       - container_array: K8S-ARRAY
-
+      - ray: ray
 plugins:
   logs:
     kubernetes-enabled: true
@@ -63,7 +64,11 @@ plugins:
         kubernetes-template-uri: http://localhost:30080/kubernetes-dashboard/#/log/{{.namespace }}/{{ .podName }}/pod?namespace={{ .namespace }}
         cloudwatch-enabled: false
         stackdriver-enabled: false
-
+  ray:
+    ttlSecondsAfterFinished: 60
+    batchScheduler:
+      scheduler: yunikorn
+      parameters: "placeholderTimeoutInSeconds=120000 gangSchedulingStyle=Hard"
 database:
   postgres:
     username: postgres
