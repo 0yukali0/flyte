@@ -98,6 +98,11 @@ type Plugin interface {
 	GetProperties() PluginProperties
 }
 
+type ScheduablePlugin interface {
+	MutateResource(ctx context.Context, object client.Object, taskTmpl *core.TaskTemplate) error
+	CommonLabels() (labels, annotations map[string]string)
+}
+
 // An optional interface a Plugin can implement to override its default OnAbort finalizer (deletion of the underlying resource).
 type PluginAbortOverride interface {
 	OnAbort(ctx context.Context, tCtx pluginsCore.TaskExecutionContext, resource client.Object) (behavior AbortBehavior, err error)
@@ -187,12 +192,4 @@ func MaybeUpdatePhaseVersionFromPluginContext(phaseInfo *pluginsCore.PhaseInfo, 
 	}
 	MaybeUpdatePhaseVersion(phaseInfo, &pluginState)
 	return nil
-}
-
-type YunikornScheduablePlugin interface {
-	MutateResourceForYunikorn(ctx context.Context, object client.Object, taskTmpl *core.TaskTemplate) (client.Object, error)
-}
-
-type KueueScheduablePlugin interface {
-	MutateResourceForKueue(ctx context.Context, object client.Object, taskTmpl *core.TaskTemplate) (client.Object, error)
 }

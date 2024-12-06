@@ -1,23 +1,40 @@
 package yunikorn
 
 import (
-	"fmt"
-
-	"github.com/google/uuid"
+	v1 "k8s.io/api/core/v1"
 )
 
-const (
-	TaskGroupGenericName = "task-group"
-)
-
-func GenerateTaskGroupName(master bool, index int) string {
-	if master {
-		return fmt.Sprintf("%s-%s", TaskGroupGenericName, "head")
+func Allocation(containers []v1.Container) v1.ResourceList {
+	totalResources := v1.ResourceList{}
+	for _, c := range containers {
+		for name, q := range c.Resources.Limits {
+			if _, exists := totalResources[name]; !exists {
+				totalResources[name] = q.DeepCopy()
+				continue
+			}
+			total := totalResources[name]
+			total.Add(q)
+			totalResources[name] = total
+		}
 	}
-	return fmt.Sprintf("%s-%s-%d", TaskGroupGenericName, "worker", index)
+	return totalResources
 }
 
-func GenerateTaskGroupAppID() string {
-	uid := uuid.New().String()
-	return fmt.Sprintf("%s-%s", TaskGroupGenericName, uid)
+func Add(left v1.ResourceList, right v1.ResourceList) v1.ResourceList {
+	result := left
+	for name, value := range left {
+		sum := value
+		if value2, ok := right[name]; ok {
+			sum.Add(value2)
+			result[name] = sum
+		} else {
+			result[name] = value
+		}
+	}
+	for name, value := range right {
+		if _, ok := left[name]; !ok {
+			result[name] = value
+		}
+	}
+	return result
 }

@@ -28,8 +28,8 @@ import (
 	"github.com/flyteorg/flyte/flyteplugins/go/tasks/pluginmachinery/k8s"
 	"github.com/flyteorg/flyte/flyteplugins/go/tasks/pluginmachinery/tasklog"
 	"github.com/flyteorg/flyte/flyteplugins/go/tasks/pluginmachinery/utils"
-	"github.com/flyteorg/flyte/flyteplugins/go/tasks/plugins/k8s/batchscheduler/kueue"
 	"github.com/flyteorg/flyte/flyteplugins/go/tasks/plugins/k8s/batchscheduler/yunikorn"
+	"github.com/flyteorg/flyte/flyteplugins/go/tasks/plugins/k8s/batchscheduler/kueue"
 )
 
 const (
@@ -553,49 +553,33 @@ func getEventInfoForRayJob(logConfig logs.LogConfig, pluginContext k8s.PluginCon
 	return &pluginsCore.TaskInfo{Logs: taskLogs}, nil
 }
 
-func (plugin rayJobResourceHandler) MutateResourceForYunikorn(ctx context.Context, object client.Object, taskTmpl *core.TaskTemplate) (client.Object, error) {
-	rayJob := object.(*rayv1.RayJob)
-	// Update gang scheduling annotations
-	if err := yunikorn.MutateRayJob(rayJob); err != nil {
-		return rayJob, err
+func (plugin rayJobResourceHandler) CommonLabels() (map[string]string, map[string]string) {
+	cfg := GetConfig().BatchScheduler
+	if schedulerName := cfg.Scheduler; schedulerName == yunikorn.Yunikorn {
+		return yunikorn.GetCommonLabels()
 	}
-	// Update Yunikorn annotations
-	cfg := GetConfig().BatchScheduler.Default.YunikornConfig
-	id := taskTmpl.Id
-	annotations := make(map[string]string, 0)
-	queueName := fmt.Sprintf("root.%s.%s", id.Project, id.Domain)
-	if len(cfg.Queue) > 0 {
-		if cfg.Queue == "namespace" {
-			queueName = fmt.Sprintf("%s.%s", queueName, rayJob.ObjectMeta.Namespace)
-		} else {
-			queueName = fmt.Sprintf("%s.%s", queueName, cfg.Queue)
-		}
-	} else {
-		queueName = fmt.Sprintf("%s.%s", queueName, id.ResourceType)
+	if schedulerName := cfg.Scheduler; schedulerName == kueue.Kueue {
+		return kueue.GetCommonLabels()
 	}
-	annotations[yunikorn.Queue] = queueName
-	annotations[yunikorn.TaskGroupParameters] = cfg.Parameters
-	yunikorn.UpdateAnnotations(annotations, rayJob)
-	return rayJob, nil
+	return make(map[string]string, 0), make(map[string]string, 0)
 }
 
-func (plugin rayJobResourceHandler) MutateResourceForKueue(ctx context.Context, object client.Object, taskTmpl *core.TaskTemplate) (client.Object, error) {
+func (plugin rayJobResourceHandler) MutateResource(ctx context.Context, object client.Object, taskTmpl *core.TaskTemplate) error {
+	cfg := GetConfig().BatchScheduler
 	rayJob := object.(*rayv1.RayJob)
-	cfg := GetConfig().BatchScheduler.Default.KueueConfig
 	id := taskTmpl.Id
-	queueName := fmt.Sprintf("%s.%s", id.Project, id.Domain)
-	if len(cfg.Queue) > 0 {
-		if cfg.Queue == "namespace" {
-			queueName = fmt.Sprintf("%s.%s", queueName, rayJob.ObjectMeta.Namespace)
-		} else {
-			queueName = fmt.Sprintf("%s.%s", queueName, cfg.Queue)
+	if schedulerName := cfg.Scheduler; schedulerName == yunikorn.Yunikorn {
+		defualtCfg := cfg.Default.YunikornConfig
+		yunikorn.CreateCommLabels("ray", id.Project, id.Domain, rayJob.ObjectMeta.Namespace, defualtCfg.Queue)
+		if err := yunikorn.MutateRayJob(rayJob, defualtCfg.Parameters); err != nil {
+			return err
 		}
-	} else {
-		queueName = fmt.Sprintf("%s.%s", queueName, id.ResourceType)
 	}
-	rayJob.ObjectMeta.Labels[kueue.QueueName] = queueName
-	rayJob.ObjectMeta.Labels[kueue.PriorityClassName] = cfg.PriorityClassName
-	return object, nil
+	if schedulerName := cfg.Scheduler; schedulerName == kueue.Kueue {
+		defualtCfg := cfg.Default.KueueConfig
+		kueue.CreateCommLabels("ray", id.Project, id.Domain, rayJob.ObjectMeta.Namespace, defualtCfg.Queue)
+	}
+	return nil
 }
 
 func (plugin rayJobResourceHandler) GetTaskPhase(ctx context.Context, pluginContext k8s.PluginContext, resource client.Object) (pluginsCore.PhaseInfo, error) {

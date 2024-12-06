@@ -1,16 +1,39 @@
 package kueue
 
 import (
-	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
-
-	"github.com/flyteorg/flyte/flyteplugins/go/tasks/plugins/k8s/batchscheduler/utils"
+	"fmt"
 )
 
 const (
-	QueueName         = "kueue.x-k8s.io/queue-name"
+	Kueue = "kueue"
+	// labels in the pod template
+	Queue         = "kueue.x-k8s.io/queue-name"
+	PodGroupName = "kueue.x-k8s.io/pod-group-name"
 	PriorityClassName = "kueue.x-k8s.io/priority-class"
+	// annotations in the pod template
+	PodGroupTotal = "kueue.x-k8s.io/pod-group-total-count"
 )
 
-func UpdateKueueLabels(labels map[string]string, app *rayv1.RayJob) {
-	utils.UpdateLabels(labels, &app.ObjectMeta)
+var (
+	ExtraLabels      = make(map[string]string, 0)
+	ExtraAnnotations = make(map[string]string, 0)
+)
+
+func GetCommonLabels() (map[string]string, map[string]string) {
+	defer cleanLabels()
+	return ExtraLabels, ExtraAnnotations
 }
+
+func CreateCommLabels(name string, project string, domain string, jobNamespace string, configuredQueue string) {
+	if queueName := fmt.Sprintf("%s.%s", project, domain); len(configuredQueue) > 0 {
+		ExtraLabels[Queue] = fmt.Sprintf("%s.%s", queueName, configuredQueue)
+	} else {
+		ExtraLabels[Queue] = fmt.Sprintf("%s.%s", queueName, jobNamespace)
+	}
+}
+
+func cleanLabels() {
+	ExtraLabels = make(map[string]string, 0)
+	ExtraAnnotations = make(map[string]string, 0)
+}
+

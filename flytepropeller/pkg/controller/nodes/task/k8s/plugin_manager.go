@@ -98,9 +98,14 @@ type PluginManager struct {
 }
 
 func (e *PluginManager) addObjectMetadata(taskCtx pluginsCore.TaskExecutionMetadata, o client.Object, cfg *config.K8sPluginConfig) {
+	extraLabels := make(map[string]string, 0)
+	extraAnnotations := make(map[string]string, 0)
+	if p, ok := e.plugin.(k8s.ScheduablePlugin); ok {
+		extraLabels, extraAnnotations = p.CommonLabels()
+	}
 	o.SetNamespace(taskCtx.GetNamespace())
-	o.SetAnnotations(pluginsUtils.UnionMaps(cfg.DefaultAnnotations, o.GetAnnotations(), pluginsUtils.CopyMap(taskCtx.GetAnnotations())))
-	o.SetLabels(pluginsUtils.UnionMaps(cfg.DefaultLabels, o.GetLabels(), pluginsUtils.CopyMap(taskCtx.GetLabels())))
+	o.SetAnnotations(pluginsUtils.UnionMaps(cfg.DefaultAnnotations, o.GetAnnotations(), pluginsUtils.CopyMap(taskCtx.GetAnnotations()), extraLabels))
+	o.SetLabels(pluginsUtils.UnionMaps(cfg.DefaultLabels, o.GetLabels(), pluginsUtils.CopyMap(taskCtx.GetLabels()), extraAnnotations))
 	o.SetName(taskCtx.GetTaskExecutionID().GetGeneratedName())
 
 	if !e.plugin.GetProperties().DisableInjectOwnerReferences {
@@ -197,17 +202,14 @@ func (e *PluginManager) launchResource(ctx context.Context, tCtx pluginsCore.Tas
 	if err != nil {
 		return pluginsCore.UnknownTransition, err
 	}
-	if p, ok := e.plugin.(k8s.YunikornScheduablePlugin); ok {
-		o, err = p.MutateResourceForYunikorn(ctx, o, tmpl)
-		if err != nil {
-			return pluginsCore.UnknownTransition, err
-		}
-		tCtx.TaskExecutionMetadata().GetTaskExecutionID().GetGeneratedName()
-	}
 
 	e.addObjectMetadata(k8sTaskCtxMetadata, o, config.GetK8sPluginConfig())
 	logger.Infof(ctx, "Creating Object: Type:[%v], Object:[%v/%v]", o.GetObjectKind().GroupVersionKind(), o.GetNamespace(), o.GetName())
-
+	if p, ok := e.plugin.(k8s.ScheduablePlugin); ok {
+		if err = p.MutateResource(ctx, o, tmpl); err != nil {
+			return pluginsCore.UnknownTransition, err
+		}
+	}
 	key := backoff.ComposeResourceKey(o)
 
 	pod, casted := o.(*v1.Pod)

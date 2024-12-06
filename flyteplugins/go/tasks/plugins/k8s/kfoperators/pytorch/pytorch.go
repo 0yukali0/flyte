@@ -11,6 +11,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/flyteorg/flyte/flyteidl/gen/pb-go/flyteidl/core"
 	"github.com/flyteorg/flyte/flyteidl/gen/pb-go/flyteidl/plugins"
 	kfplugins "github.com/flyteorg/flyte/flyteidl/gen/pb-go/flyteidl/plugins/kubeflow"
 	flyteerr "github.com/flyteorg/flyte/flyteplugins/go/tasks/errors"
@@ -19,6 +20,8 @@ import (
 	"github.com/flyteorg/flyte/flyteplugins/go/tasks/pluginmachinery/k8s"
 	"github.com/flyteorg/flyte/flyteplugins/go/tasks/pluginmachinery/utils"
 	"github.com/flyteorg/flyte/flyteplugins/go/tasks/plugins/k8s/kfoperators/common"
+	"github.com/flyteorg/flyte/flyteplugins/go/tasks/plugins/k8s/batchscheduler/yunikorn"
+	"github.com/flyteorg/flyte/flyteplugins/go/tasks/plugins/k8s/batchscheduler/kueue"
 )
 
 type pytorchOperatorResourceHandler struct {
@@ -40,6 +43,37 @@ func (pytorchOperatorResourceHandler) BuildIdentityResource(ctx context.Context,
 			APIVersion: kubeflowv1.SchemeGroupVersion.String(),
 		},
 	}, nil
+}
+
+func (pytorchOperatorResourceHandler) CommonLabels() (map[string]string, map[string]string) {
+	cfg := common.GetConfig().BatchScheduler
+	if schedulerName := cfg.Scheduler; schedulerName == yunikorn.Yunikorn {
+		return yunikorn.GetCommonLabels()
+	}
+	if schedulerName := cfg.Scheduler; schedulerName == kueue.Kueue {
+		return kueue.GetCommonLabels()
+	}
+	return make(map[string]string, 0), make(map[string]string, 0)
+}
+
+func (pytorchOperatorResourceHandler) MutateResource(ctx context.Context, object client.Object, taskTmpl *core.TaskTemplate) error {
+	cfg := common.GetConfig().BatchScheduler
+	pytorchjob := object.(*kubeflowv1.PyTorchJob)
+	id := taskTmpl.Id
+	if schedulerName := cfg.Scheduler; schedulerName == yunikorn.Yunikorn {
+		defualtCfg := cfg.Default.YunikornConfig
+		yunikorn.CreateCommLabels("pytorch", id.Project, id.Domain, pytorchjob.ObjectMeta.Namespace, defualtCfg.Queue)
+		/*
+		if err := yunikorn.MutatePytorchJob(pytorchjob, defualtCfg.Parameters); err != nil {
+			return err
+		}
+		*/
+	}
+	if schedulerName := cfg.Scheduler; schedulerName == kueue.Kueue {
+		defualtCfg := cfg.Default.KueueConfig
+		kueue.CreateCommLabels("pytorch", id.Project, id.Domain, pytorchjob.ObjectMeta.Namespace, defualtCfg.Queue)
+	}
+	return nil
 }
 
 // Defines a func to create the full resource object that will be posted to k8s.

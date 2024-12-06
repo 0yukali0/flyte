@@ -28,3 +28,19 @@ func UpdatePodTemplateAnnotatations(wanted map[string]string, pod *v1.PodTemplat
 func UpdatePodTemplateLabels(wanted map[string]string, pod *v1.PodTemplateSpec) {
 	UpdateLabels(wanted, &pod.ObjectMeta)
 }
+
+type Group struct {
+	Master *v1.PodTemplateSpec
+	ExtraMasterResource *v1.ResourceList
+	Workers []*v1.PodTemplateSpec
+	WorkerReplica []int32
+}
+
+func NewGroup() Group {
+	return Group{
+		Master: nil,
+		ExtraMasterResource: nil,
+		Workers: make([]*v1.PodTemplateSpec, 0),
+		WorkerReplica: make([]int32, 0),
+	}
+}

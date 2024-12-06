@@ -12,6 +12,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/flyteorg/flyte/flyteidl/gen/pb-go/flyteidl/core"
 	"github.com/flyteorg/flyte/flyteidl/gen/pb-go/flyteidl/plugins"
 	kfplugins "github.com/flyteorg/flyte/flyteidl/gen/pb-go/flyteidl/plugins/kubeflow"
 	flyteerr "github.com/flyteorg/flyte/flyteplugins/go/tasks/errors"
@@ -20,6 +21,8 @@ import (
 	"github.com/flyteorg/flyte/flyteplugins/go/tasks/pluginmachinery/k8s"
 	"github.com/flyteorg/flyte/flyteplugins/go/tasks/pluginmachinery/utils"
 	"github.com/flyteorg/flyte/flyteplugins/go/tasks/plugins/k8s/kfoperators/common"
+	"github.com/flyteorg/flyte/flyteplugins/go/tasks/plugins/k8s/batchscheduler/yunikorn"
+	"github.com/flyteorg/flyte/flyteplugins/go/tasks/plugins/k8s/batchscheduler/kueue"
 )
 
 const workerSpecCommandKey = "worker_spec_command"
@@ -43,6 +46,37 @@ func (mpiOperatorResourceHandler) BuildIdentityResource(ctx context.Context, tas
 			APIVersion: kubeflowv1.SchemeGroupVersion.String(),
 		},
 	}, nil
+}
+
+func (mpiOperatorResourceHandler) CommonLabels() (map[string]string, map[string]string) {
+	cfg := common.GetConfig().BatchScheduler
+	if schedulerName := cfg.Scheduler; schedulerName == yunikorn.Yunikorn {
+		return yunikorn.GetCommonLabels()
+	}
+	if schedulerName := cfg.Scheduler; schedulerName == kueue.Kueue {
+		return kueue.GetCommonLabels()
+	}
+	return make(map[string]string, 0), make(map[string]string, 0)
+}
+
+func (mpiOperatorResourceHandler) MutateResource(ctx context.Context, object client.Object, taskTmpl *core.TaskTemplate) error {
+	cfg := common.GetConfig().BatchScheduler
+	mpijob := object.(*kubeflowv1.MPIJob)
+	id := taskTmpl.Id
+	if schedulerName := cfg.Scheduler; schedulerName == yunikorn.Yunikorn {
+		defualtCfg := cfg.Default.YunikornConfig
+		yunikorn.CreateCommLabels("mpi", id.Project, id.Domain, mpijob.ObjectMeta.Namespace, defualtCfg.Queue)
+		/*
+		if err := yunikorn.MutateMPIJob(mpijob, defualtCfg.Parameters); err != nil {
+			return err
+		}
+		*/
+	}
+	if schedulerName := cfg.Scheduler; schedulerName == kueue.Kueue {
+		defualtCfg := cfg.Default.KueueConfig
+		kueue.CreateCommLabels("mpi", id.Project, id.Domain, mpijob.ObjectMeta.Namespace, defualtCfg.Queue)
+	}
+	return nil
 }
 
 // Defines a func to create the full resource object that will be posted to k8s.
