@@ -28,6 +28,7 @@ import (
 
 	"github.com/flyteorg/flyte/v2/flytestdlib/logger"
 	"github.com/flyteorg/flyte/v2/flytestdlib/otelutils"
+	"github.com/flyteorg/flyte/v2/flytestdlib/promutils"
 )
 
 const otelServiceName = "runs-service"
@@ -78,13 +79,17 @@ func Setup(ctx context.Context, sc *app.SetupContext) error {
 		projectsURL,
 		connect.WithInterceptors(otelInterceptor),
 	)
+	metricsScope := sc.Scope
+	if metricsScope == nil {
+		metricsScope = promutils.NewScope("runs")
+	}
 	abortReconciler := service.NewAbortReconciler(repo, actionsClient, service.AbortReconcilerConfig{
 		Workers:      5,
 		MaxAttempts:  10,
 		QueueSize:    1000,
 		InitialDelay: time.Second,
 		MaxDelay:     5 * time.Minute,
-	})
+	}, metricsScope)
 	sc.AddWorker("abort-reconciler", func(ctx context.Context) error {
 		return abortReconciler.Run(ctx)
 	})

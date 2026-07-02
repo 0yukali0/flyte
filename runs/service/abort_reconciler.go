@@ -11,13 +11,44 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/flyteorg/flyte/v2/flytestdlib/logger"
+	"github.com/flyteorg/flyte/v2/flytestdlib/promutils"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/actions"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/actions/actionsconnect"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/common"
 	"github.com/flyteorg/flyte/v2/runs/repository/interfaces"
 )
+
+const (
+	resultSuccess = "success"
+	resultFailure = "failure"
+	resultDropped = "dropped"
+)
+
+// abortReconcilerMetrics holds the Prometheus metrics emitted by AbortReconciler.
+type abortReconcilerMetrics struct {
+	queueDepth        prometheus.Gauge
+	processed         *prometheus.CounterVec
+	retries           prometheus.Counter
+	processingLatency promutils.StopWatch
+}
+
+func newAbortReconcilerMetrics(scope promutils.Scope) *abortReconcilerMetrics {
+	processed := scope.MustNewCounterVec("processed", "Count of completed abort processing attempts by result", "result")
+	// Pre-initialize all label values so they appear on /metrics from process start.
+	processed.WithLabelValues(resultSuccess)
+	processed.WithLabelValues(resultFailure)
+	processed.WithLabelValues(resultDropped)
+
+	return &abortReconcilerMetrics{
+		queueDepth:        scope.MustNewGauge("queue_depth", "Number of abort tasks currently buffered in the queue"),
+		processed:         processed,
+		retries:           scope.MustNewCounter("retries", "Count of task requeues for another attempt"),
+		processingLatency: scope.MustNewStopWatch("processing_latency", "Wall time of each processTask call", time.Millisecond),
+	}
+}
 
 // AbortReconcilerConfig holds tunables for the reconciler.
 type AbortReconcilerConfig struct {
@@ -53,15 +84,17 @@ type abortTask struct {
 // dedupeQueue is an in-memory, key-deduplicated work queue backed by a Go channel.
 // Pushing a key that is already present (being processed or waiting for requeue) is a no-op.
 type dedupeQueue struct {
-	mu   sync.Mutex
-	keys map[string]struct{}
-	ch   chan abortTask
+	mu         sync.Mutex
+	keys       map[string]struct{}
+	ch         chan abortTask
+	queueDepth prometheus.Gauge
 }
 
-func newDedupeQueue(size int) *dedupeQueue {
+func newDedupeQueue(size int, queueDepth prometheus.Gauge) *dedupeQueue {
 	return &dedupeQueue{
-		keys: make(map[string]struct{}),
-		ch:   make(chan abortTask, size),
+		keys:       make(map[string]struct{}),
+		ch:         make(chan abortTask, size),
+		queueDepth: queueDepth,
 	}
 }
 
@@ -78,12 +111,25 @@ func (q *dedupeQueue) push(ctx context.Context, task abortTask) bool {
 
 	select {
 	case q.ch <- task:
+		q.queueDepth.Inc()
 		return true
 	case <-ctx.Done():
 		q.mu.Lock()
 		delete(q.keys, task.key)
 		q.mu.Unlock()
 		return false
+	}
+}
+
+// pop blocks until a task is available or ctx is cancelled, decrementing the
+// queue-depth gauge to keep it symmetric with push.
+func (q *dedupeQueue) pop(ctx context.Context) (abortTask, bool) {
+	select {
+	case task := <-q.ch:
+		q.queueDepth.Dec()
+		return task, true
+	case <-ctx.Done():
+		return abortTask{}, false
 	}
 }
 
@@ -114,10 +160,11 @@ type AbortReconciler struct {
 	actionsClient actionsconnect.ActionsServiceClient
 	queue         *dedupeQueue
 	cfg           AbortReconcilerConfig
+	metrics       *abortReconcilerMetrics
 }
 
 // NewAbortReconciler creates a new AbortReconciler. Zero-value cfg fields are filled with defaults.
-func NewAbortReconciler(repo interfaces.Repository, actionsClient actionsconnect.ActionsServiceClient, cfg AbortReconcilerConfig) *AbortReconciler {
+func NewAbortReconciler(repo interfaces.Repository, actionsClient actionsconnect.ActionsServiceClient, cfg AbortReconcilerConfig, scope promutils.Scope) *AbortReconciler {
 	def := defaultConfig()
 	if cfg.Workers <= 0 {
 		cfg.Workers = def.Workers
@@ -134,11 +181,13 @@ func NewAbortReconciler(repo interfaces.Repository, actionsClient actionsconnect
 	if cfg.MaxDelay <= 0 {
 		cfg.MaxDelay = def.MaxDelay
 	}
+	metrics := newAbortReconcilerMetrics(scope.NewSubScope("abort_reconciler"))
 	return &AbortReconciler{
 		repo:          repo,
 		actionsClient: actionsClient,
-		queue:         newDedupeQueue(cfg.QueueSize),
+		queue:         newDedupeQueue(cfg.QueueSize, metrics.queueDepth),
 		cfg:           cfg,
+		metrics:       metrics,
 	}
 }
 
@@ -206,28 +255,32 @@ func (r *AbortReconciler) startupScan(ctx context.Context) error {
 // runWorker processes tasks from the queue until ctx is cancelled.
 func (r *AbortReconciler) runWorker(ctx context.Context) {
 	for {
-		select {
-		case <-ctx.Done():
+		task, ok := r.queue.pop(ctx)
+		if !ok {
 			return
-		case task := <-r.queue.ch:
-			r.processTask(ctx, task)
 		}
+		r.processTask(ctx, task)
 	}
 }
 
 // processTask increments the attempt counter then calls actionsClient.Abort.
 // On success it clears the DB flag. On failure it schedules a retry or gives up.
 func (r *AbortReconciler) processTask(ctx context.Context, task abortTask) {
+	timer := r.metrics.processingLatency.Start()
+	defer timer.Stop()
+
 	attemptCount, err := r.repo.ActionRepo().MarkAbortAttempt(ctx, task.actionID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Action no longer exists in the DB — nothing to abort, drop it.
 			r.queue.remove(task.key)
+			r.metrics.processed.WithLabelValues(resultDropped).Inc()
 			logger.Warnf(ctx, "AbortReconciler: action %s not found in DB, dropping abort task", task.key)
 			return
 		}
 		logger.Errorf(ctx, "AbortReconciler: failed to mark attempt for %s: %v", task.key, err)
 		// Re-enqueue without counting — the DB row is authoritative; try again later.
+		r.metrics.retries.Inc()
 		r.queue.scheduleRequeue(ctx, task, r.cfg.InitialDelay)
 		return
 	}
@@ -244,10 +297,12 @@ func (r *AbortReconciler) processTask(ctx context.Context, task abortTask) {
 			logger.Errorf(ctx, "AbortReconciler: failed to clear abort request for %s: %v", task.key, clearErr)
 		}
 		r.queue.remove(task.key)
+		r.metrics.processed.WithLabelValues(resultSuccess).Inc()
 		logger.Infof(ctx, "AbortReconciler: successfully aborted %s (attempt %d)", task.key, attemptCount)
 		return
 	}
 
+	r.metrics.processed.WithLabelValues(resultFailure).Inc()
 	logger.Warnf(ctx, "AbortReconciler: abort failed for %s (attempt %d/%d): %v",
 		task.key, attemptCount, r.cfg.MaxAttempts, abortErr)
 
@@ -269,6 +324,7 @@ func (r *AbortReconciler) processTask(ctx context.Context, task abortTask) {
 	}
 	delay := time.Duration(rand.Int63n(int64(ceiling) + 1))
 	logger.Infof(ctx, "AbortReconciler: scheduling retry for %s in %s", task.key, delay)
+	r.metrics.retries.Inc()
 	r.queue.scheduleRequeue(ctx, task, delay)
 }
 

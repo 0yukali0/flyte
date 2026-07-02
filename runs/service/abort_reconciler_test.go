@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
+	"github.com/flyteorg/flyte/v2/flytestdlib/promutils"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/actions"
 	actionsconnectmocks "github.com/flyteorg/flyte/v2/gen/go/flyteidl2/actions/actionsconnect/mocks"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/common"
@@ -33,7 +35,7 @@ func newTestReconciler(t *testing.T) (*repoMocks.ActionRepo, *actionsconnectmock
 		QueueSize:    100,
 		InitialDelay: 10 * time.Millisecond,
 		MaxDelay:     50 * time.Millisecond,
-	})
+	}, promutils.NewTestScope())
 	return actionRepo, actionsClient, reconciler
 }
 
@@ -230,4 +232,81 @@ func TestAbortReconciler_NotFoundTreatedAsSuccess(t *testing.T) {
 		"ClearAbortRequest should be called even when actionsClient returns NotFound")
 	// No retry should happen — only 1 abort call expected.
 	actionsClient.AssertNumberOfCalls(t, "Abort", 1)
+}
+
+func TestAbortReconciler_MetricsSuccessPath(t *testing.T) {
+	actionRepo, actionsClient, reconciler := newTestReconciler(t)
+	actionID := abortTestActionID()
+
+	var cleared atomic.Bool
+	actionRepo.On("ListPendingAborts", mock.Anything).Return([]*models.Action{abortTestAction(actionID)}, nil).Once()
+	actionRepo.On("GetAction", mock.Anything, mock.Anything).Return(abortTestAction(actionID), nil).Maybe()
+	actionRepo.On("MarkAbortAttempt", mock.Anything, mock.Anything).Return(1, nil).Once()
+	actionsClient.On("Abort", mock.Anything, mock.Anything).
+		Return(connect.NewResponse(&actions.AbortResponse{}), nil).Once()
+	actionRepo.On("ClearAbortRequest", mock.Anything, mock.Anything).
+		Run(func(_ mock.Arguments) { cleared.Store(true) }).
+		Return(nil).Once()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go func() { _ = reconciler.Run(ctx) }()
+
+	assert.Eventually(t, cleared.Load, 400*time.Millisecond, 5*time.Millisecond)
+
+	assert.Eventually(t, func() bool {
+		return testutil.ToFloat64(reconciler.metrics.processed.WithLabelValues(resultSuccess)) == 1
+	}, 400*time.Millisecond, 5*time.Millisecond, "processed{success} should reach 1")
+	assert.Equal(t, float64(0), testutil.ToFloat64(reconciler.metrics.retries))
+	assert.Equal(t, float64(0), testutil.ToFloat64(reconciler.metrics.queueDepth), "queue_depth should be 0 after draining")
+}
+
+func TestAbortReconciler_MetricsRetryPath(t *testing.T) {
+	actionRepo, actionsClient, reconciler := newTestReconciler(t)
+	actionID := abortTestActionID()
+
+	var cleared atomic.Bool
+	actionRepo.On("ListPendingAborts", mock.Anything).Return([]*models.Action{abortTestAction(actionID)}, nil).Once()
+	actionRepo.On("GetAction", mock.Anything, mock.Anything).Return(abortTestAction(actionID), nil).Maybe()
+
+	actionRepo.On("MarkAbortAttempt", mock.Anything, mock.Anything).Return(1, nil).Once()
+	actionsClient.On("Abort", mock.Anything, mock.Anything).Return(nil, errors.New("unavailable")).Once()
+
+	actionRepo.On("MarkAbortAttempt", mock.Anything, mock.Anything).Return(2, nil).Once()
+	actionsClient.On("Abort", mock.Anything, mock.Anything).Return(nil, errors.New("unavailable")).Once()
+
+	actionRepo.On("MarkAbortAttempt", mock.Anything, mock.Anything).Return(3, nil).Once()
+	actionsClient.On("Abort", mock.Anything, mock.Anything).
+		Return(connect.NewResponse(&actions.AbortResponse{}), nil).Once()
+	actionRepo.On("ClearAbortRequest", mock.Anything, mock.Anything).
+		Run(func(_ mock.Arguments) { cleared.Store(true) }).
+		Return(nil).Once()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = reconciler.Run(ctx) }()
+
+	assert.Eventually(t, cleared.Load, 1500*time.Millisecond, 10*time.Millisecond)
+
+	assert.Equal(t, float64(2), testutil.ToFloat64(reconciler.metrics.processed.WithLabelValues(resultFailure)))
+	assert.Equal(t, float64(2), testutil.ToFloat64(reconciler.metrics.retries))
+	assert.Equal(t, float64(1), testutil.ToFloat64(reconciler.metrics.processed.WithLabelValues(resultSuccess)))
+}
+
+func TestAbortReconciler_MetricsDedupePushNoOp(t *testing.T) {
+	_, _, reconciler := newTestReconciler(t)
+	actionID := abortTestActionID()
+
+	// No workers running, so pushed tasks sit in the queue and the gauge
+	// change from a duplicate push can be observed directly.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	reconciler.Push(ctx, actionID, "first")
+	depthAfterFirst := testutil.ToFloat64(reconciler.metrics.queueDepth)
+	assert.Equal(t, float64(1), depthAfterFirst)
+
+	reconciler.Push(ctx, actionID, "dup")
+	assert.Equal(t, depthAfterFirst, testutil.ToFloat64(reconciler.metrics.queueDepth),
+		"duplicate push should not change queue_depth")
 }

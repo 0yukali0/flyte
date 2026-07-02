@@ -14,11 +14,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 
 	"github.com/flyteorg/flyte/v2/flytestdlib/config"
 	"github.com/flyteorg/flyte/v2/flytestdlib/config/viper"
 	"github.com/flyteorg/flyte/v2/flytestdlib/logger"
+	"github.com/flyteorg/flyte/v2/flytestdlib/promutils"
 )
 
 // App is the shared entry-point skeleton for Flyte services.
@@ -76,9 +78,10 @@ func (a *App) serve(ctx context.Context) error {
 
 	// 2. Build SetupContext with defaults
 	sc := &SetupContext{
-		Host: "0.0.0.0",
-		Port: 8080,
-		Mux:  http.NewServeMux(),
+		Host:  "0.0.0.0",
+		Port:  8080,
+		Mux:   http.NewServeMux(),
+		Scope: promutils.NewScope(a.Name),
 	}
 
 	// 3. Let the caller populate resources & register handlers
@@ -107,6 +110,7 @@ func (a *App) serve(ctx context.Context) error {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("OK"))
 		})
+		sc.Mux.Handle("/metrics", promhttp.Handler())
 
 		var handler http.Handler = sc.Mux
 		if sc.Middleware != nil {
