@@ -1519,7 +1519,7 @@
     {
       "id": 27,
       "type": "row",
-      "title": "Postgres",
+      "title": "Notification saturation",
       "collapsed": false,
       "datasource": {
         "type": "prometheus",
@@ -1534,10 +1534,10 @@
       "panels": []
     },
     {
-      "id": 28,
+      "id": 37,
       "type": "timeseries",
-      "title": "Notification buffer eviction rate",
-      "description": "Rate of notifications evicted when the pending notification queue exceeds the configured notificationBufferLimit.",
+      "title": "Notification queue utilization",
+      "description": "Pending notifications in each runs-service queue (action / run) divided by notificationBufferLimit. Staying near 100% means the NOTIFY pump is not keeping up and notifications will start to be evicted.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1545,12 +1545,14 @@
       "gridPos": {
         "x": 0,
         "y": 63,
-        "w": 24,
+        "w": 12,
         "h": 8
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "ops",
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
           "color": {
             "mode": "palette-classic"
           },
@@ -1563,7 +1565,7 @@
               "mode": "none"
             },
             "thresholdsStyle": {
-              "mode": "area"
+              "mode": "line"
             }
           },
           "thresholds": {
@@ -1574,8 +1576,12 @@
                 "value": null
               },
               {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
                 "color": "red",
-                "value": 1e-9
+                "value": 0.8
               }
             ]
           }
@@ -1606,7 +1612,7 @@
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "orange"
+                  "fixedColor": "dark-blue"
                 }
               }
             ]
@@ -1634,25 +1640,91 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum(rate(runs_notification_evictions_total{service_name=\"runs-service\",buffer_from=\"action\"}[5m])) or vector(0)",
-          "legendFormat": "action"
+          "expr": "max by (buffer_from)(runs_notification_pending{service_name=\"runs-service\"}) / on() group_left max(runs_notification_buffer_limit{service_name=\"runs-service\"})",
+          "legendFormat": "{{buffer_from}}"
+        }
+      ]
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Notification NOTIFY errors",
+      "description": "Rate of NOTIFY batches that failed and were requeued, per queue and reason (no_connection = no NOTIFY connection available; exec_error = pg_notify statement failed). While errors persist the pump backs off (retryMinBackoff \u2192 retryMaxBackoff), so queue utilization rises.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 63,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1e-9
+              }
+            ]
+          }
         },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "refId": "B",
-          "expr": "sum(rate(runs_notification_evictions_total{service_name=\"runs-service\",buffer_from=\"run\"}[5m])) or vector(0)",
-          "legendFormat": "run"
+          "refId": "A",
+          "expr": "sum by (buffer_from, reason)(rate(runs_notification_errors_total{service_name=\"runs-service\"}[5m])) or vector(0)",
+          "legendFormat": "{{buffer_from}} / {{reason}}"
         }
       ]
     },
     {
-      "id": 29,
+      "id": 28,
       "type": "timeseries",
-      "title": "Subscriber notification drop rate",
-      "description": "Rate of notifications dropped because a watch subscriber channel was full (see watchBufferSize).",
+      "title": "Notification rate (sent / evicted / dropped)",
+      "description": "Average rate of runs-service notifications, per queue (action / run): sent = delivered by the NOTIFY pump (pg_notify); evicted = dropped because the pending queue exceeded notificationBufferLimit; dropped = discarded because a watch subscriber channel was full (see watchBufferSize). Any non-zero evicted/dropped rate means notifications are being lost.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1661,122 +1733,7 @@
         "x": 0,
         "y": 71,
         "w": 24,
-        "h": 8
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "area"
-            }
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 1e-9
-              }
-            ]
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "action"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "blue"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "run"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "orange"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "refId": "A",
-          "expr": "sum(rate(runs_notification_subscriber_drops_total{service_name=\"runs-service\",buffer_from=\"action\"}[5m])) or vector(0)",
-          "legendFormat": "action"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "refId": "B",
-          "expr": "sum(rate(runs_notification_subscriber_drops_total{service_name=\"runs-service\",buffer_from=\"run\"}[5m])) or vector(0)",
-          "legendFormat": "run"
-        }
-      ]
-    },
-    {
-      "id": 34,
-      "type": "timeseries",
-      "title": "Notification sent rate",
-      "description": "Rate of notifications successfully delivered by the runs-service NOTIFY pump (pg_notify), per queue.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "x": 0,
-        "y": 79,
-        "w": 24,
-        "h": 8
+        "h": 10
       },
       "fieldConfig": {
         "defaults": {
@@ -1798,7 +1755,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "action"
+              "options": "sent (action)"
             },
             "properties": [
               {
@@ -1813,7 +1770,22 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "run"
+              "options": "sent (run)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "dark-blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "evicted (action)"
             },
             "properties": [
               {
@@ -1821,6 +1793,51 @@
                 "value": {
                   "mode": "fixed",
                   "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "evicted (run)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "dark-orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dropped (action)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dropped (run)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "dark-red"
                 }
               }
             ]
@@ -1849,7 +1866,7 @@
           },
           "refId": "A",
           "expr": "sum(rate(runs_notification_sent_total{service_name=\"runs-service\",buffer_from=\"action\"}[5m])) or vector(0)",
-          "legendFormat": "action"
+          "legendFormat": "sent (action)"
         },
         {
           "datasource": {
@@ -1858,7 +1875,118 @@
           },
           "refId": "B",
           "expr": "sum(rate(runs_notification_sent_total{service_name=\"runs-service\",buffer_from=\"run\"}[5m])) or vector(0)",
-          "legendFormat": "run"
+          "legendFormat": "sent (run)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "C",
+          "expr": "sum(rate(runs_notification_evictions_total{service_name=\"runs-service\",buffer_from=\"action\"}[5m])) or vector(0)",
+          "legendFormat": "evicted (action)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "D",
+          "expr": "sum(rate(runs_notification_evictions_total{service_name=\"runs-service\",buffer_from=\"run\"}[5m])) or vector(0)",
+          "legendFormat": "evicted (run)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "E",
+          "expr": "sum(rate(runs_notification_subscriber_drops_total{service_name=\"runs-service\",buffer_from=\"action\"}[5m])) or vector(0)",
+          "legendFormat": "dropped (action)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "F",
+          "expr": "sum(rate(runs_notification_subscriber_drops_total{service_name=\"runs-service\",buffer_from=\"run\"}[5m])) or vector(0)",
+          "legendFormat": "dropped (run)"
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "type": "row",
+      "title": "Run/Action Throughput",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 81,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Run RPC throughput (average processing rate)",
+      "description": "Average processing rate of InternalRunService, EventsProxyService/Record and ActionsService/Enqueue RPCs.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 82,
+        "w": 24,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "p95",
+            "p50"
+          ],
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum by (rpc_method)(rate(rpc_server_call_duration_seconds_count{rpc_method=~\"flyteidl2.workflow.InternalRunService/(UpdateActionStatus|UpdateActionStatusStream|RecordAction|RecordActionStream|RecordActionEvents|RecordActionEventStream)|flyteidl2.workflow.EventsProxyService/Record|flyteidl2.actions.ActionsService/Enqueue\"}[5m]))",
+          "legendFormat": "{{rpc_method}}"
         }
       ]
     }

@@ -74,12 +74,6 @@ func newNotifyTestRepo(notificationConfig NotificationConfig) *actionRepo {
 	}
 }
 
-func (r *actionRepo) pendingCounts() (actions, runs int) {
-	r.notifyMu.Lock()
-	defer r.notifyMu.Unlock()
-	return len(r.pendingActionQueue), len(r.pendingRunQueue)
-}
-
 func newNotifyRepoWithDB(t *testing.T) (*actionRepo, *sql.DB, *sql.Conn) {
 	t.Helper()
 	db := setupActionDB(t)
@@ -1208,6 +1202,103 @@ func TestNotificationEvictionsMetric(t *testing.T) {
 		string(notificationBufferAction): 1,
 		string(notificationBufferRun):    2,
 	}, counts)
+}
+
+func TestNotificationQueueGauges(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	metrics, err := newNotificationMetrics(provider)
+	require.NoError(t, err)
+
+	repo := &actionRepo{
+		pendingActions:      make(map[string]struct{}),
+		pendingRuns:         make(map[string]struct{}),
+		pendingCh:           make(chan struct{}, 1),
+		notificationConfig:  NotificationConfig{bufferLimit: 10},
+		notificationMetrics: metrics,
+	}
+	require.NoError(t, metrics.registerQueueGauges(repo.notificationConfig.bufferLimit, repo.pendingCounts))
+
+	repo.markActionPending("action-1")
+	repo.markActionPending("action-2")
+	repo.markActionPending("action-3")
+	repo.markRunPending("run-1")
+
+	pending, ok := collectNotificationMetric(t, reader, notificationPendingMetricName).Data.(metricdata.Gauge[int64])
+	require.True(t, ok)
+	counts := make(map[string]int64)
+	for _, point := range pending.DataPoints {
+		bufferFrom, ok := point.Attributes.Value(attribute.Key("buffer_from"))
+		require.True(t, ok)
+		counts[bufferFrom.AsString()] = point.Value
+	}
+	assert.Equal(t, map[string]int64{
+		string(notificationBufferAction): 3,
+		string(notificationBufferRun):    1,
+	}, counts)
+
+	limit, ok := collectNotificationMetric(t, reader, notificationBufferLimitMetricName).Data.(metricdata.Gauge[int64])
+	require.True(t, ok)
+	require.Len(t, limit.DataPoints, 1)
+	assert.Equal(t, int64(10), limit.DataPoints[0].Value)
+}
+
+func TestRegisterQueueGaugesNilMetrics(t *testing.T) {
+	var metrics *notificationMetrics
+	assert.NoError(t, metrics.registerQueueGauges(10, func() (int, int) { return 0, 0 }))
+}
+
+func TestRunNotifyLoop_RecordsNoConnectionErrors(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	metrics, err := newNotificationMetrics(provider)
+	require.NoError(t, err)
+
+	r := newNotifyTestRepo(testNotificationConfig)
+	r.notificationMetrics = metrics
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.notifyActionUpdate(ctx, notifyTestActionID("undeliverable"))
+	r.notifyRunUpdate(ctx, &common.RunIdentifier{Project: "proj", Domain: "domain", Name: "run"})
+
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		r.runNotifyLoop(ctx, nil, nil)
+	}()
+
+	// With no connection, every send attempt fails and must be counted per queue.
+	assert.Eventually(t, func() bool {
+		var resourceMetrics metricdata.ResourceMetrics
+		require.NoError(t, reader.Collect(context.Background(), &resourceMetrics))
+		seen := make(map[string]bool)
+		for _, scopeMetrics := range resourceMetrics.ScopeMetrics {
+			for _, m := range scopeMetrics.Metrics {
+				if m.Name != notificationErrorsMetricName {
+					continue
+				}
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				require.True(t, ok)
+				for _, point := range sum.DataPoints {
+					bufferFrom, _ := point.Attributes.Value(attribute.Key("buffer_from"))
+					reason, _ := point.Attributes.Value(attribute.Key("reason"))
+					if reason.AsString() == string(notifyErrorNoConnection) && point.Value > 0 {
+						seen[bufferFrom.AsString()] = true
+					}
+				}
+			}
+		}
+		return seen[string(notificationBufferAction)] && seen[string(notificationBufferRun)]
+	}, 5*time.Second, 20*time.Millisecond, "failed NOTIFY batches must be counted")
+
+	cancel()
+	select {
+	case <-loopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runNotifyLoop did not return after its context was cancelled")
+	}
 }
 
 func collectNotificationMetric(t *testing.T, reader *sdkmetric.ManualReader, name string) metricdata.Metrics {

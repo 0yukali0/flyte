@@ -27,19 +27,24 @@ import (
 )
 
 const (
-	rootActionName                                   = "a0"
-	defaultNotificationBufferSize                    = 256
-	defaultWatchBufferSize                           = 100
-	notifyRetryMinBackoff                            = 50 * time.Millisecond
-	notifyRetryMaxBackoff                            = 5 * time.Second
-	defaultNotifyBatchSize                           = 100
-	maxNotifyBatchSize                               = 10_000
-	notificationMeterName                            = "runs-repository"
-	notificationDeletedMetricName                    = "runs.notification.evictions"
-	notificationDroppedMetricName                    = "runs.notification.subscriber_drops"
-	notificationSentMetricName                       = "runs.notification.sent"
-	notificationBufferAction      notificationBuffer = "action"
-	notificationBufferRun         notificationBuffer = "run"
+	rootActionName                                       = "a0"
+	defaultNotificationBufferSize                        = 256
+	defaultWatchBufferSize                               = 100
+	notifyRetryMinBackoff                                = 50 * time.Millisecond
+	notifyRetryMaxBackoff                                = 5 * time.Second
+	defaultNotifyBatchSize                               = 100
+	maxNotifyBatchSize                                   = 10_000
+	notificationMeterName                                = "runs-repository"
+	notificationDeletedMetricName                        = "runs.notification.evictions"
+	notificationDroppedMetricName                        = "runs.notification.subscriber_drops"
+	notificationSentMetricName                           = "runs.notification.sent"
+	notificationPendingMetricName                        = "runs.notification.pending"
+	notificationBufferLimitMetricName                    = "runs.notification.buffer_limit"
+	notificationErrorsMetricName                         = "runs.notification.errors"
+	notificationBufferAction          notificationBuffer = "action"
+	notificationBufferRun             notificationBuffer = "run"
+	notifyErrorNoConnection           notifyErrorReason  = "no_connection"
+	notifyErrorExec                   notifyErrorReason  = "exec_error"
 )
 
 // Defaults for the pq.Listener behind LISTEN/NOTIFY.
@@ -70,6 +75,9 @@ var activePhases = []int32{
 
 type notificationBuffer string
 
+// notifyErrorReason labels why a NOTIFY batch could not be delivered.
+type notifyErrorReason string
+
 // NotificationConfig configures the pending notification queues and delivery retries.
 type NotificationConfig struct {
 	bufferLimit     int
@@ -83,9 +91,11 @@ type NotificationConfig struct {
 }
 
 type notificationMetrics struct {
+	meter                        metric.Meter
 	notifyDeletedCount           metric.Int64Counter
 	subscriberDroppedNotifyCount metric.Int64Counter
 	notifySentCount              metric.Int64Counter
+	notifyErrorCount             metric.Int64Counter
 }
 
 func newNotificationMetrics(provider metric.MeterProvider) (*notificationMetrics, error) {
@@ -96,7 +106,9 @@ func newNotificationMetrics(provider metric.MeterProvider) (*notificationMetrics
 		return nil, nil
 	}
 
-	notifyDeletedCount, err := provider.Meter(notificationMeterName).Int64Counter(
+	meter := provider.Meter(notificationMeterName)
+
+	notifyDeletedCount, err := meter.Int64Counter(
 		notificationDeletedMetricName,
 		metric.WithDescription("Pending notifications evicted because the notification queue reached its limit"),
 	)
@@ -104,7 +116,7 @@ func newNotificationMetrics(provider metric.MeterProvider) (*notificationMetrics
 		return nil, err
 	}
 
-	subscriberDroppedNotifyCount, err := provider.Meter(notificationMeterName).Int64Counter(
+	subscriberDroppedNotifyCount, err := meter.Int64Counter(
 		notificationDroppedMetricName,
 		metric.WithDescription("Notifications dropped because a subscriber channel was full"),
 	)
@@ -112,7 +124,7 @@ func newNotificationMetrics(provider metric.MeterProvider) (*notificationMetrics
 		return nil, err
 	}
 
-	notifySentCount, err := provider.Meter(notificationMeterName).Int64Counter(
+	notifySentCount, err := meter.Int64Counter(
 		notificationSentMetricName,
 		metric.WithDescription("Notifications successfully sent by batched pg_notify"),
 	)
@@ -120,11 +132,56 @@ func newNotificationMetrics(provider metric.MeterProvider) (*notificationMetrics
 		return nil, err
 	}
 
+	notifyErrorCount, err := meter.Int64Counter(
+		notificationErrorsMetricName,
+		metric.WithDescription("NOTIFY batches that failed to send and were requeued for retry"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &notificationMetrics{
+		meter:                        meter,
 		notifyDeletedCount:           notifyDeletedCount,
 		subscriberDroppedNotifyCount: subscriberDroppedNotifyCount,
 		notifySentCount:              notifySentCount,
+		notifyErrorCount:             notifyErrorCount,
 	}, nil
+}
+
+// registerQueueGauges reports the pending queue lengths and the configured queue limit, so dashboards can show
+// how close each queue is to evicting notifications.
+func (m *notificationMetrics) registerQueueGauges(bufferLimit int, pendingCounts func() (actions, runs int)) error {
+	if m == nil || m.meter == nil {
+		return nil
+	}
+
+	pending, err := m.meter.Int64ObservableGauge(
+		notificationPendingMetricName,
+		metric.WithDescription("Notifications waiting in the pending queue to be sent by pg_notify"),
+	)
+	if err != nil {
+		return err
+	}
+
+	limit, err := m.meter.Int64ObservableGauge(
+		notificationBufferLimitMetricName,
+		metric.WithDescription("Maximum pending entries in each notification queue (notificationBufferLimit)"),
+	)
+	if err != nil {
+		return err
+	}
+
+	actionAttrs := metric.WithAttributes(attribute.String("buffer_from", string(notificationBufferAction)))
+	runAttrs := metric.WithAttributes(attribute.String("buffer_from", string(notificationBufferRun)))
+	_, err = m.meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		actions, runs := pendingCounts()
+		o.ObserveInt64(pending, int64(actions), actionAttrs)
+		o.ObserveInt64(pending, int64(runs), runAttrs)
+		o.ObserveInt64(limit, int64(bufferLimit))
+		return nil
+	}, pending, limit)
+	return err
 }
 
 func (m *notificationMetrics) recordDeleted(ctx context.Context, bufferFrom notificationBuffer, count int64) {
@@ -139,6 +196,16 @@ func (m *notificationMetrics) recordSubscriberDropped(ctx context.Context, buffe
 		return
 	}
 	m.subscriberDroppedNotifyCount.Add(ctx, count, metric.WithAttributes(attribute.String("buffer_from", string(bufferFrom))))
+}
+
+func (m *notificationMetrics) recordError(ctx context.Context, bufferFrom notificationBuffer, reason notifyErrorReason) {
+	if m == nil || m.notifyErrorCount == nil {
+		return
+	}
+	m.notifyErrorCount.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("buffer_from", string(bufferFrom)),
+		attribute.String("reason", string(reason)),
+	))
 }
 
 func (m *notificationMetrics) recordSent(ctx context.Context, bufferFrom notificationBuffer, count int64) {
@@ -238,6 +305,10 @@ func NewActionRepo(
 	repo.pendingRuns = make(map[string]struct{}, defaultNotificationBufferSize)
 	repo.pendingRunQueue = make([]string, 0, defaultNotificationBufferSize)
 	repo.pendingCh = make(chan struct{}, 1)
+
+	if err := notificationMetrics.registerQueueGauges(notificationConfig.bufferLimit, repo.pendingCounts); err != nil {
+		return nil, fmt.Errorf("register notification queue metrics: %w", err)
+	}
 
 	if err := repo.startPostgresListener(); err != nil {
 		return nil, fmt.Errorf("failed to start postgres listener: %w", err)
@@ -1237,6 +1308,13 @@ func (r *actionRepo) takePendingNotifications() (actions, runs []string) {
 	return actions, runs
 }
 
+// pendingCounts returns how many notifications are waiting in the action and run queues.
+func (r *actionRepo) pendingCounts() (actions, runs int) {
+	r.notifyMu.Lock()
+	defer r.notifyMu.Unlock()
+	return len(r.pendingActionQueue), len(r.pendingRunQueue)
+}
+
 func (r *actionRepo) mergePendingActions(actions []string) {
 	if len(actions) == 0 {
 		return
@@ -1416,16 +1494,18 @@ func (r *actionRepo) runNotifyLoop(ctx context.Context, sqlDB *sql.DB, conn *sql
 		}
 	}
 
-	execNotify := func(channel, query string, args []any) bool {
+	execNotify := func(channel string, bufferFrom notificationBuffer, query string, args []any) bool {
 		if conn == nil {
 			reconnect()
 		}
 		if conn == nil {
 			logger.Errorf(ctx, "No NOTIFY connection available, keeping %s notifications pending", channel)
+			r.notificationMetrics.recordError(ctx, bufferFrom, notifyErrorNoConnection)
 			return false
 		}
 		if _, err := conn.ExecContext(ctx, query, args...); err != nil {
 			logger.Errorf(ctx, "Failed to NOTIFY %s notifications: %v", channel, err)
+			r.notificationMetrics.recordError(ctx, bufferFrom, notifyErrorExec)
 			if isConnError(err) {
 				reconnect()
 			}
@@ -1449,7 +1529,7 @@ func (r *actionRepo) runNotifyLoop(ctx context.Context, sqlDB *sql.DB, conn *sql
 				fmt.Fprintf(&query, "pg_notify($1, $%d)", i+2)
 				args = append(args, payload)
 			}
-			if !execNotify(channel, query.String(), args) {
+			if !execNotify(channel, bufferFrom, query.String(), args) {
 				return payloads[start:]
 			}
 			r.notificationMetrics.recordSent(ctx, bufferFrom, int64(len(chunk)))
